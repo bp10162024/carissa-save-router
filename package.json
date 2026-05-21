@@ -1,0 +1,16 @@
+{
+  "name": "carissa-save-router",
+  "version": "1.0.0",
+  "description": "Receives Churnkey webhooks, filters for 30+ EE customers, creates urgent HubSpot tasks for Carissa across Tier 0/1/2 retention plays. Parallel to Nick's existing BP app webhook handler.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.50.0",
+    "express": "^4.19.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
