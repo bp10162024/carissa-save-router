@@ -107,13 +107,39 @@ async function lookupCustomer(stripeCustomerId) {
   if (se) console.error('[lookup] oracle_account_state error:', se.message);
   const state = (states && states[0]) || null;
 
-  return { customer, state };
+  // 90-day peak employee_count from history. This catches the downgrade-then-
+  // cancel scenario (account was at 47 EE, dropped to 1 EE, then cancelled) —
+  // without this lookup the router would skip them because current EE is below
+  // the threshold. oracle_account_state_history is an append-only daily
+  // snapshot populated by trg_snapshot_account_state on every upsert to
+  // oracle_account_state.
+  let peak90 = null;
+  if (state?.bp_account_id) {
+    const ninetyDaysAgoISO = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000)
+      .toISOString()
+      .slice(0, 10);
+    const { data: peaks, error: pe } = await supabase
+      .from('oracle_account_state_history')
+      .select('active_employee_count, snapshot_date')
+      .eq('bp_account_id', state.bp_account_id)
+      .gte('snapshot_date', ninetyDaysAgoISO)
+      .order('active_employee_count', { ascending: false })
+      .limit(1);
+    if (pe) console.error('[lookup] oracle_account_state_history error:', pe.message);
+    peak90 = (peaks && peaks[0]) || null;
+  }
+
+  return { customer, state, peak90 };
 }
 
-function meetsBigCustomerThreshold({ customer, state }) {
+function meetsBigCustomerThreshold({ customer, state, peak90 }) {
   const mrr = customer?.mrr ? parseFloat(customer.mrr) : 0;
   const ee = state?.active_employee_count ?? customer?.employee_count ?? 0;
-  return mrr >= 200 || ee >= 30;
+  const peakEE = peak90?.active_employee_count ?? 0;
+  // Current MRR/EE OR historical 90-day peak EE. The historical-peak check
+  // is what catches downgrade-then-cancel customers — without it, an account
+  // that was 47 EE three months ago but is 1 EE today gets ignored entirely.
+  return mrr >= 200 || ee >= 30 || peakEE >= 30;
 }
 
 // ============================================================
@@ -282,26 +308,30 @@ async function handleChurnkeyEvent(event) {
   const companyId = lookup.customer?.hubspot_company_id || null;
   const mrr = lookup.customer?.mrr ? `$${Math.round(parseFloat(lookup.customer.mrr))}/mo` : '?';
   const ee = lookup.state?.active_employee_count ?? lookup.customer?.employee_count ?? '?';
+  const peakEE = lookup.peak90?.active_employee_count ?? null;
+  // Show "1 (peak 47 in last 90d)" when the historical-peak rule is what
+  // qualified them, so it's obvious in the logs WHY this account is in Carissa's queue.
+  const eeDisplay = (peakEE != null && typeof ee === 'number' && peakEE > ee) ? `${ee} (peak ${peakEE} in last 90d)` : `${ee}`;
   const plan = lookup.state?.plan_name || lookup.customer?.plan || '?';
   const industry = lookup.state?.industry_name || lookup.customer?.industry || '?';
 
   // ---- Log-only mode? ----
   if (!ROUTER_ENABLED) {
-    const summary = { handled: false, reason: 'SAVE_ROUTER_ENABLED is not true — log-only mode', tier: tierKey, company: companyName, mrr, ee, plan, industry };
+    const summary = { handled: false, reason: 'SAVE_ROUTER_ENABLED is not true — log-only mode', tier: tierKey, company: companyName, mrr, ee, peakEE, plan, industry };
     console.log('[handleChurnkeyEvent log-only]', JSON.stringify(summary));
     return summary;
   }
 
   // ---- Live mode ----
-  const result = { handled: true, tier: tierKey, company: companyName, mrr, ee, plan, industry, actions: {} };
+  const result = { handled: true, tier: tierKey, company: companyName, mrr, ee, peakEE, plan, industry, actions: {} };
 
   // 1. Create HubSpot task
   try {
     const dueAtMs = Date.now() + tier.dueDays * 24 * 60 * 60 * 1000;
-    const subject = `[Churnkey ${tier.emoji}] ${tier.label} — ${companyName} (${mrr} • ${ee} EE)`;
+    const subject = `[Churnkey ${tier.emoji}] ${tier.label} — ${companyName} (${mrr} • ${eeDisplay} EE)`;
     const bodyLines = [
       `${tier.label}`,
-      `${companyName} • ${mrr} • ${ee} EE • ${plan} plan • ${industry}`,
+      `${companyName} • ${mrr} • ${eeDisplay} EE • ${plan} plan • ${industry}`,
       '',
       `Churnkey session result: ${event.result || '?'}`,
       `Accepted offer: ${event.acceptedOffer?.offerType || 'none'}`,
@@ -346,7 +376,7 @@ async function handleChurnkeyEvent(event) {
     const slaText = tier.dueDays === 0 ? '4-hour SLA' : `${tier.dueDays}-day SLA`;
     const blocks = [
       { type: 'header', text: { type: 'plain_text', text: `${tier.emoji} ${tier.label}` }},
-      { type: 'section', text: { type: 'mrkdwn', text: `*${companyName}* — ${mrr} • ${ee} EE • ${plan} • ${industry}\nSLA: ${slaText} • Save-eligible: ${tier.saveEligible ? 'yes' : 'no'}` }},
+      { type: 'section', text: { type: 'mrkdwn', text: `*${companyName}* — ${mrr} • ${eeDisplay} EE • ${plan} • ${industry}\nSLA: ${slaText} • Save-eligible: ${tier.saveEligible ? 'yes' : 'no'}` }},
       { type: 'section', text: { type: 'mrkdwn', text: `Churnkey result: \`${event.result || '?'}\` • Offer: \`${event.acceptedOffer?.offerType || 'none'}\`` }},
     ];
     if (companyId) {
