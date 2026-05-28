@@ -7,7 +7,9 @@
  *   Tier 1 — Contact offer accepted (real-time handoff). URGENT HubSpot task,
  *            4-hour SLA, save-bonus-eligible. Slack alert in #carissa-chat.
  *   Tier 2 — Cancel completed (winback). HIGH HubSpot task, 7-day SLA,
- *            save-bonus-eligible. Slack alert.
+ *            save-bonus-eligible. Slack alert. Also writes cancel_reason
+ *            (extracted from Churnkey survey response) to the HubSpot company
+ *            so Aspire workflows can branch the cancel sequence on reason.
  *   Tier 0 — Aborted Churnkey flow ("free money on the table"). MEDIUM task,
  *            same-day SLA. Slack alert.
  *
@@ -143,6 +145,106 @@ function meetsBigCustomerThreshold({ customer, state, peak90 }) {
 }
 
 // ============================================================
+// Cancel-reason extraction (Churnkey exit-survey → canonical category)
+// ============================================================
+
+/**
+ * Extracts a canonical cancel reason from a Churnkey session event.
+ * Churnkey returns the survey answer in event.surveyResponse — shape varies
+ * (sometimes a string, sometimes { reason: ... }, sometimes { answers: [...] }).
+ * We stringify the whole thing and keyword-match against the four categories
+ * Kirsten cares about for branching the cancellation sequence:
+ *   - "No Longer Need"  (most common, ~64%)
+ *   - "Better Alternative" (~16%)
+ *   - "Price" (~13%)
+ *   - "Fit" (~10%)
+ *
+ * Returns null if event.surveyResponse is missing entirely, "Other" if
+ * present but doesn't match any keyword set. Canonical strings match the
+ * cancel_reason HubSpot company property values that Aspire workflows
+ * branch on.
+ */
+function extractCancelReason(event) {
+  const survey = event?.surveyResponse;
+  if (!survey) return null;
+
+  // Stringify everything we can find. Handle: plain string, object, array.
+  let blob = '';
+  try {
+    if (typeof survey === 'string') {
+      blob = survey;
+    } else {
+      blob = JSON.stringify(survey);
+    }
+  } catch {
+    return null;
+  }
+  if (!blob || blob === '{}' || blob === '[]') return null;
+
+  const text = blob.toLowerCase();
+
+  // Order matters: more-specific patterns first so a phrase like
+  // "switched to a cheaper alternative" doesn't fall into "Price" by accident.
+
+  // "Better Alternative" — explicit competitor mention or switching language
+  if (
+    /\bcompetitor\b/.test(text) ||
+    /\bswitch(ed|ing)?\b/.test(text) ||
+    /\balternative\b/.test(text) ||
+    /\bother (tool|software|product|app|solution)\b/.test(text) ||
+    /\bfound (a |another )?better\b/.test(text) ||
+    /\bmoving to\b/.test(text) ||
+    /(quickbooks time|qb time|tsheets|connecteam|homebase|when i work|deputy|7shifts|bamboo|rippling|gusto|paychex|adp)/.test(text)
+  ) {
+    return 'Better Alternative';
+  }
+
+  // "Price" — affordability/cost language
+  if (
+    /\b(too )?expensive\b/.test(text) ||
+    /\bcost(s|ly|ing)?\b/.test(text) ||
+    /\bprice\b/.test(text) ||
+    /\bbudget\b/.test(text) ||
+    /\baffordab(le|ility)\b/.test(text) ||
+    /\bcheaper\b/.test(text) ||
+    /\btoo much\b/.test(text)
+  ) {
+    return 'Price';
+  }
+
+  // "Fit" — wrong tool for them, missing feature, doesn't work for their case
+  if (
+    /\bdoesn['']?t (work|fit|suit|match|meet)\b/.test(text) ||
+    /\bmissing (feature|functionality)\b/.test(text) ||
+    /\bnot (the )?right (fit|tool|solution|product)\b/.test(text) ||
+    /\bwrong (fit|tool|solution)\b/.test(text) ||
+    /\bneed (different|something else)\b/.test(text) ||
+    /\bfeatures? (we |i )?need\b/.test(text) ||
+    /\blimitations?\b/.test(text)
+  ) {
+    return 'Fit';
+  }
+
+  // "No Longer Need" — business closed, project ended, downsized
+  if (
+    /\bno longer\b/.test(text) ||
+    /\bdon['']?t need\b/.test(text) ||
+    /\bbusiness (closed|closing|shut|sold)\b/.test(text) ||
+    /\bproject (ended|done|complete)\b/.test(text) ||
+    /\b(closed|closing|out of business)\b/.test(text) ||
+    /\b(seasonal|temporary|short[-\s]?term)\b/.test(text) ||
+    /\bdownsized?\b/.test(text) ||
+    /\b(reduce|reduced|fewer) (employees|staff|team)\b/.test(text) ||
+    /\bnot using\b/.test(text)
+  ) {
+    return 'No Longer Need';
+  }
+
+  // Present but didn't match any category
+  return 'Other';
+}
+
+// ============================================================
 // HubSpot helpers
 // ============================================================
 
@@ -190,17 +292,18 @@ async function createTaskOnCompany({ companyId, subject, body, priority, dueAtMs
   return hsRequest('POST', '/crm/v3/objects/tasks', payload);
 }
 
-async function updateCompanySaveState(companyId, { increment = true } = {}) {
+async function updateCompanySaveState(companyId, { increment = true, cancelReason = null, cancellationPending = false } = {}) {
   if (!companyId) return null;
   // Read current state so we don't trample downstream save_status values
   let current = null;
   try {
-    current = await hsRequest('GET', `/crm/v3/objects/companies/${companyId}?properties=save_status,save_attempt_count`);
+    current = await hsRequest('GET', `/crm/v3/objects/companies/${companyId}?properties=save_status,save_attempt_count,cancel_reason`);
   } catch (e) {
     if (e.status !== 404) console.error('[updateCompanySaveState] read failed:', e.message);
   }
   const curStatus = current?.properties?.save_status || null;
   const curCount = parseInt(current?.properties?.save_attempt_count || '0', 10);
+  const curReason = current?.properties?.cancel_reason || null;
 
   const props = {
     save_attempt_logged: 'true',
@@ -211,6 +314,21 @@ async function updateCompanySaveState(companyId, { increment = true } = {}) {
     props.save_status = 'at_risk';
   }
   if (increment) props.save_attempt_count = String(curCount + 1);
+
+  // cancel_reason: write only when provided, and only if not already set
+  // (preserves the original survey-derived reason on the first cancel — if
+  // a customer winbacks and re-cancels later, that's a new save loop and
+  // should be a separate analysis cycle).
+  if (cancelReason && !curReason) {
+    props.cancel_reason = cancelReason;
+  }
+
+  // bp_cancellation_pending: TIER_2 cancels flip this to true so Aspire's
+  // suppression rules + "Any-stage to Churned" workflow can fire without
+  // waiting for the nightly bp-signal-sync run.
+  if (cancellationPending) {
+    props.bp_cancellation_pending = 'true';
+  }
 
   return hsRequest('PATCH', `/crm/v3/objects/companies/${companyId}`, { properties: props });
 }
@@ -315,15 +433,21 @@ async function handleChurnkeyEvent(event) {
   const plan = lookup.state?.plan_name || lookup.customer?.plan || '?';
   const industry = lookup.state?.industry_name || lookup.customer?.industry || '?';
 
+  // Extract canonical cancel reason from the Churnkey survey response.
+  // Only meaningful for TIER_2_CANCELLED (actual cancels) — Tier 1 (saved)
+  // and Tier 0 (aborted) don't get the reason written because they didn't
+  // complete the survey.
+  const cancelReason = tierKey === 'TIER_2_CANCELLED' ? extractCancelReason(event) : null;
+
   // ---- Log-only mode? ----
   if (!ROUTER_ENABLED) {
-    const summary = { handled: false, reason: 'SAVE_ROUTER_ENABLED is not true — log-only mode', tier: tierKey, company: companyName, mrr, ee, peakEE, plan, industry };
+    const summary = { handled: false, reason: 'SAVE_ROUTER_ENABLED is not true — log-only mode', tier: tierKey, company: companyName, mrr, ee, peakEE, plan, industry, cancel_reason: cancelReason };
     console.log('[handleChurnkeyEvent log-only]', JSON.stringify(summary));
     return summary;
   }
 
   // ---- Live mode ----
-  const result = { handled: true, tier: tierKey, company: companyName, mrr, ee, peakEE, plan, industry, actions: {} };
+  const result = { handled: true, tier: tierKey, company: companyName, mrr, ee, peakEE, plan, industry, cancel_reason: cancelReason, actions: {} };
 
   // 1. Create HubSpot task
   try {
@@ -337,8 +461,11 @@ async function handleChurnkeyEvent(event) {
       `Accepted offer: ${event.acceptedOffer?.offerType || 'none'}`,
       `Session timestamp: ${event.timestamp || new Date().toISOString()}`,
     ];
+    if (cancelReason) {
+      bodyLines.push('', `Cancel reason (extracted from survey): ${cancelReason}`);
+    }
     if (event.surveyResponse) {
-      bodyLines.push('', 'Survey response:', JSON.stringify(event.surveyResponse, null, 2));
+      bodyLines.push('', 'Survey response (raw):', JSON.stringify(event.surveyResponse, null, 2));
     }
     if (tier.saveEligible) {
       bodyLines.push('', '✅ Save-bonus-eligible. Confirmation locks in after 90-day clawback.');
@@ -358,11 +485,15 @@ async function handleChurnkeyEvent(event) {
     result.actions.task_error = e.message;
   }
 
-  // 2. Update Company save state
+  // 2. Update Company save state + cancel_reason (when applicable)
   if (companyId) {
     try {
-      await updateCompanySaveState(companyId);
+      await updateCompanySaveState(companyId, {
+        cancelReason,
+        cancellationPending: tierKey === 'TIER_2_CANCELLED',
+      });
       result.actions.company_state_updated = true;
+      if (cancelReason) result.actions.cancel_reason_written = cancelReason;
     } catch (e) {
       console.error('[company state]', e.message);
       result.actions.company_state_error = e.message;
@@ -374,9 +505,11 @@ async function handleChurnkeyEvent(event) {
   // 3. Slack alert
   try {
     const slaText = tier.dueDays === 0 ? '4-hour SLA' : `${tier.dueDays}-day SLA`;
+    const headerLines = [`*${companyName}* — ${mrr} • ${eeDisplay} EE • ${plan} • ${industry}`, `SLA: ${slaText} • Save-eligible: ${tier.saveEligible ? 'yes' : 'no'}`];
+    if (cancelReason) headerLines.push(`Cancel reason: \`${cancelReason}\``);
     const blocks = [
       { type: 'header', text: { type: 'plain_text', text: `${tier.emoji} ${tier.label}` }},
-      { type: 'section', text: { type: 'mrkdwn', text: `*${companyName}* — ${mrr} • ${eeDisplay} EE • ${plan} • ${industry}\nSLA: ${slaText} • Save-eligible: ${tier.saveEligible ? 'yes' : 'no'}` }},
+      { type: 'section', text: { type: 'mrkdwn', text: headerLines.join('\n') }},
       { type: 'section', text: { type: 'mrkdwn', text: `Churnkey result: \`${event.result || '?'}\` • Offer: \`${event.acceptedOffer?.offerType || 'none'}\`` }},
     ];
     if (companyId) {
@@ -426,7 +559,7 @@ app.post('/webhooks/churnkey', async (req, res) => {
  *
  * Example:
  *   curl -X POST .../admin/simulate -H 'Content-Type: application/json' \
- *     -d '{"event":"session","result":"cancel","customer":{"customerId":"cus_..."},"acceptedOffer":null}'
+ *     -d '{"event":"session","result":"cancel","customer":{"customerId":"cus_..."},"acceptedOffer":null,"surveyResponse":{"reason":"Too expensive"}}'
  */
 app.post('/admin/simulate', async (req, res) => {
   try {
@@ -436,6 +569,16 @@ app.post('/admin/simulate', async (req, res) => {
     console.error('[simulate]', e);
     res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+/**
+ * GET /admin/test-reason?text=... — quick check the extractCancelReason
+ * keyword matcher against an arbitrary phrase. Returns the canonical category.
+ */
+app.get('/admin/test-reason', (req, res) => {
+  const text = req.query.text || '';
+  const reason = extractCancelReason({ surveyResponse: text });
+  res.json({ input: text, reason });
 });
 
 app.listen(PORT, () => {
